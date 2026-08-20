@@ -12,7 +12,7 @@ import {
   Radio,
 } from "lucide-react";
 
-import.meta.env.VITE_API_BASE_URL;
+import.meta.env.VITE_apiBase;
 
 // Mirrors the backend exactly: utils/shard.util.js + validators/order.validator.js
 const TOTAL_SHARDS = 4;
@@ -33,7 +33,8 @@ function validateOrder(row) {
   };
   if (!order.order_id) throw new Error("Invalid order_id");
   if (!order.customer_id) throw new Error("Invalid customer_id");
-  if (Number.isNaN(order.order_date.getTime())) throw new Error("Invalid order_date");
+  if (Number.isNaN(order.order_date.getTime()))
+    throw new Error("Invalid order_date");
   if (Number.isNaN(order.order_amount)) throw new Error("Invalid order_amount");
   if (!order.status) throw new Error("Invalid status");
   return order;
@@ -76,10 +77,10 @@ export default function BulkShardDashboard() {
   const [file, setFile] = useState(null);
   const [dragActive, setDragActive] = useState(false);
   const [mode, setMode] = useState("demo"); // "demo" | "live"
-  // const [apiBase, setApiBase] = useState("/api");
 
-  const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || "/api";
+  const [apiBase, setApiBase] = useState(
+    import.meta.env.VITE_apiBase || "/api",
+  );
   const [showSettings, setShowSettings] = useState(false);
   const [health, setHealth] = useState("unknown"); // unknown | ok | down | checking
 
@@ -118,115 +119,148 @@ export default function BulkShardDashboard() {
     setErrorMsg("");
   }, []);
 
-  const pickFile = useCallback((f) => {
-    if (!f) return;
-    if (!/\.csv$/i.test(f.name) && f.type !== "text/csv") {
-      setErrorMsg("Only .csv files are accepted.");
-      return;
-    }
-    reset();
-    setFile(f);
-  }, [reset]);
+  const pickFile = useCallback(
+    (f) => {
+      if (!f) return;
+      if (!/\.csv$/i.test(f.name) && f.type !== "text/csv") {
+        setErrorMsg("Only .csv files are accepted.");
+        return;
+      }
+      reset();
+      setFile(f);
+    },
+    [reset],
+  );
 
   const useSample = useCallback(() => {
     reset();
     const blob = new Blob([SAMPLE_CSV], { type: "text/csv" });
-    const sampleFile = new File([blob], "sample-orders.csv", { type: "text/csv" });
+    const sampleFile = new File([blob], "sample-orders.csv", {
+      type: "text/csv",
+    });
     setFile(sampleFile);
   }, [reset]);
 
   const testConnection = useCallback(async () => {
     setHealth("checking");
     try {
-      const res = await fetch(`${API_BASE_URL}/health`, { method: "GET" });
+      const res = await fetch(`${apiBase}/health`, { method: "GET" });
       setHealth(res.ok ? "ok" : "down");
     } catch {
       setHealth("down");
     }
-  }, [API_BASE_URL]);
+  }, [apiBase]);
 
-  const runDemoPipeline = useCallback(async (rows) => {
-    const BATCH_SIZE = 1000;
-    const total = rows.length;
-    const chunkSize = Math.max(1, Math.ceil(total / 40));
-    let successCount = 0;
-    let failedCount = 0;
-    const shards = [0, 0, 0, 0];
-    let sinceFlush = 0;
+  const runDemoPipeline = useCallback(
+    async (rows) => {
+      const BATCH_SIZE = 1000;
+      const total = rows.length;
+      const chunkSize = Math.max(1, Math.ceil(total / 40));
+      let successCount = 0;
+      let failedCount = 0;
+      const shards = [0, 0, 0, 0];
+      let sinceFlush = 0;
 
-    for (let i = 0; i < total; i += chunkSize) {
-      if (cancelRef.current) return;
-      const chunk = rows.slice(i, i + chunkSize);
-      let touchedShard = null;
+      for (let i = 0; i < total; i += chunkSize) {
+        if (cancelRef.current) return;
+        const chunk = rows.slice(i, i + chunkSize);
+        let touchedShard = null;
 
-      for (let j = 0; j < chunk.length; j++) {
-        const rowNum = i + j + 1;
-        const row = chunk[j];
+        for (let j = 0; j < chunk.length; j++) {
+          const rowNum = i + j + 1;
+          const row = chunk[j];
+          try {
+            const order = validateOrder(row);
+            const shard = getShardKey(order.customer_id);
+            shards[shard] += 1;
+            touchedShard = shard;
+            successCount += 1;
+            sinceFlush += 1;
+          } catch (err) {
+            failedCount += 1;
+            setFailedRows((prev) => [
+              ...prev,
+              { row: rowNum, reason: err.message, data: row },
+            ]);
+            appendLog(
+              "FAILED_RECORD",
+              `Row ${rowNum}: ${err.message} | ${JSON.stringify(row)}`,
+            );
+          }
+        }
+
+        setShardCounts([...shards]);
+        setActiveShard(touchedShard);
+        setStats({
+          total: i + chunk.length,
+          success: successCount,
+          failed: failedCount,
+        });
+
+        if (sinceFlush >= BATCH_SIZE) {
+          appendLog("INFO", `Inserted batch of ${sinceFlush} records`);
+          sinceFlush = 0;
+        }
+
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => setTimeout(r, 45));
+      }
+
+      if (sinceFlush > 0) {
+        appendLog("INFO", `Inserted batch of ${sinceFlush} records`);
+      }
+      setActiveShard(null);
+      setStatus("done");
+    },
+    [appendLog],
+  );
+
+  const submitLive = useCallback(
+    async (parsedRows) => {
+      // Client-side pass purely to drive the shard visualization, since the
+      // real insert + sharding happens server-side and only aggregate stats
+      // come back.
+      const shards = [0, 0, 0, 0];
+      parsedRows.forEach((row) => {
         try {
           const order = validateOrder(row);
-          const shard = getShardKey(order.customer_id);
-          shards[shard] += 1;
-          touchedShard = shard;
-          successCount += 1;
-          sinceFlush += 1;
-        } catch (err) {
-          failedCount += 1;
-          setFailedRows((prev) => [...prev, { row: rowNum, reason: err.message, data: row }]);
-          appendLog("FAILED_RECORD", `Row ${rowNum}: ${err.message} | ${JSON.stringify(row)}`);
+          shards[getShardKey(order.customer_id)] += 1;
+        } catch {
+          /* server will report the authoritative failure count */
         }
+      });
+      setShardCounts(shards);
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      appendLog("INFO", `POST ${apiBase}/upload-orders`);
+      const res = await fetch(`${apiBase}/upload-orders`, {
+        method: "POST",
+        body: formData,
+      });
+      const body = await res.json().catch(() => null);
+
+      if (!res.ok || !body?.success) {
+        throw new Error(
+          body?.message || `Request failed with status ${res.status}`,
+        );
       }
 
-      setShardCounts([...shards]);
-      setActiveShard(touchedShard);
-      setStats({ total: i + chunk.length, success: successCount, failed: failedCount });
-
-      if (sinceFlush >= BATCH_SIZE) {
-        appendLog("INFO", `Inserted batch of ${sinceFlush} records`);
-        sinceFlush = 0;
-      }
-
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => setTimeout(r, 45));
-    }
-
-    if (sinceFlush > 0) {
-      appendLog("INFO", `Inserted batch of ${sinceFlush} records`);
-    }
-    setActiveShard(null);
-    setStatus("done");
-  }, [appendLog]);
-
-  const submitLive = useCallback(async (parsedRows) => {
-    // Client-side pass purely to drive the shard visualization, since the
-    // real insert + sharding happens server-side and only aggregate stats
-    // come back.
-    const shards = [0, 0, 0, 0];
-    parsedRows.forEach((row) => {
-      try {
-        const order = validateOrder(row);
-        shards[getShardKey(order.customer_id)] += 1;
-      } catch {
-        /* server will report the authoritative failure count */
-      }
-    });
-    setShardCounts(shards);
-
-    const formData = new FormData();
-    formData.append("file", file);
-
-    appendLog("INFO", `POST ${API_BASE_URL}/upload-orders`);
-    const res = await fetch(`${API_BASE_URL}/upload-orders`, { method: "POST", body: formData });
-    const body = await res.json().catch(() => null);
-
-    if (!res.ok || !body?.success) {
-      throw new Error(body?.message || `Request failed with status ${res.status}`);
-    }
-
-    const { totalRows = 0, successfulRows = 0, failedRows: fr = 0 } = body.data || {};
-    setStats({ total: totalRows, success: successfulRows, failed: fr });
-    appendLog("INFO", `Server reported ${successfulRows}/${totalRows} rows inserted`);
-    setStatus("done");
-  }, [API_BASE_URL, file, appendLog]);
+      const {
+        totalRows = 0,
+        successfulRows = 0,
+        failedRows: fr = 0,
+      } = body.data || {};
+      setStats({ total: totalRows, success: successfulRows, failed: fr });
+      appendLog(
+        "INFO",
+        `Server reported ${successfulRows}/${totalRows} rows inserted`,
+      );
+      setStatus("done");
+    },
+    [apiBase, file, appendLog],
+  );
 
   const process = useCallback(() => {
     if (!file) return;
@@ -264,12 +298,15 @@ export default function BulkShardDashboard() {
     });
   }, [file, mode, runDemoPipeline, submitLive, appendLog]);
 
-  const onDrop = useCallback((e) => {
-    e.preventDefault();
-    setDragActive(false);
-    const f = e.dataTransfer.files?.[0];
-    pickFile(f);
-  }, [pickFile]);
+  const onDrop = useCallback(
+    (e) => {
+      e.preventDefault();
+      setDragActive(false);
+      const f = e.dataTransfer.files?.[0];
+      pickFile(f);
+    },
+    [pickFile],
+  );
 
   const maxShard = Math.max(1, ...shardCounts);
   const isBusy = status === "parsing" || status === "processing";
@@ -308,8 +345,8 @@ export default function BulkShardDashboard() {
               BulkShard
             </h1>
             <p className="mt-1.5 max-w-md text-sm text-[#8A93A6]">
-              Upload a CSV of orders. Each valid row is hashed by customer and routed to one of{" "}
-              {TOTAL_SHARDS} shards for insert.
+              Upload a CSV of orders. Each valid row is hashed by customer and
+              routed to one of {TOTAL_SHARDS} shards for insert.
             </p>
           </div>
 
@@ -326,11 +363,14 @@ export default function BulkShardDashboard() {
                 health === "ok"
                   ? "border-[#2DD4BF]/40 bg-[#2DD4BF]/10 text-[#2DD4BF]"
                   : health === "down"
-                  ? "border-[#FB7185]/40 bg-[#FB7185]/10 text-[#FB7185]"
-                  : "border-[#232C3D] bg-[#121826] text-[#8A93A6]"
+                    ? "border-[#FB7185]/40 bg-[#FB7185]/10 text-[#FB7185]"
+                    : "border-[#232C3D] bg-[#121826] text-[#8A93A6]"
               }`}
             >
-              <Radio size={12} className={health === "checking" ? "bs-pulse" : ""} />
+              <Radio
+                size={12}
+                className={health === "checking" ? "bs-pulse" : ""}
+              />
               {health === "ok" && "api reachable"}
               {health === "down" && "api unreachable"}
               {health === "checking" && "checking\u2026"}
@@ -346,7 +386,9 @@ export default function BulkShardDashboard() {
                 <button
                   onClick={() => setMode("demo")}
                   className={`px-3 py-1.5 text-xs font-medium transition ${
-                    mode === "demo" ? "bg-[#F5A623] text-[#0A0E14]" : "bg-transparent text-[#8A93A6] hover:text-[#E7EBF3]"
+                    mode === "demo"
+                      ? "bg-[#F5A623] text-[#0A0E14]"
+                      : "bg-transparent text-[#8A93A6] hover:text-[#E7EBF3]"
                   }`}
                 >
                   Demo (in-browser)
@@ -354,14 +396,16 @@ export default function BulkShardDashboard() {
                 <button
                   onClick={() => setMode("live")}
                   className={`px-3 py-1.5 text-xs font-medium transition ${
-                    mode === "live" ? "bg-[#F5A623] text-[#0A0E14]" : "bg-transparent text-[#8A93A6] hover:text-[#E7EBF3]"
+                    mode === "live"
+                      ? "bg-[#F5A623] text-[#0A0E14]"
+                      : "bg-transparent text-[#8A93A6] hover:text-[#E7EBF3]"
                   }`}
                 >
                   Live (call /api)
                 </button>
               </div>
               <input
-                value={API_BASE_URL}
+                value={apiBase}
                 onChange={(e) => setApiBase(e.target.value)}
                 placeholder="/api"
                 className="w-48 rounded-md border border-[#232C3D] bg-[#0A0E14] px-3 py-1.5 font-mono text-xs text-[#E7EBF3] outline-none focus:border-[#38BDF8]/60"
@@ -374,8 +418,9 @@ export default function BulkShardDashboard() {
               </button>
             </div>
             <p className="max-w-xs text-xs leading-relaxed text-[#8A93A6]">
-              Demo mode parses and routes entirely in your browser \u2014 nothing is sent anywhere.
-              Live mode posts the file to <span className="font-mono">{API_BASE_URL}/upload-orders</span>.
+              Demo mode parses and routes entirely in your browser \u2014
+              nothing is sent anywhere. Live mode posts the file to{" "}
+              <span className="font-mono">{apiBase}/upload-orders</span>.
             </p>
           </div>
         )}
@@ -411,12 +456,18 @@ export default function BulkShardDashboard() {
                   <p className="flex items-center gap-1.5 font-mono text-sm text-[#E7EBF3]">
                     <FileText size={14} /> {file.name}
                   </p>
-                  <p className="mt-1 text-xs text-[#8A93A6]">{(file.size / 1024).toFixed(1)} KB \u2014 click to replace</p>
+                  <p className="mt-1 text-xs text-[#8A93A6]">
+                    {(file.size / 1024).toFixed(1)} KB \u2014 click to replace
+                  </p>
                 </>
               ) : (
                 <>
-                  <p className="text-sm text-[#E7EBF3]">Drop a CSV here to route</p>
-                  <p className="mt-1 text-xs text-[#8A93A6]">or click to browse \u2014 up to 20MB</p>
+                  <p className="text-sm text-[#E7EBF3]">
+                    Drop a CSV here to route
+                  </p>
+                  <p className="mt-1 text-xs text-[#8A93A6]">
+                    or click to browse \u2014 up to 20MB
+                  </p>
                 </>
               )}
             </div>
@@ -433,7 +484,11 @@ export default function BulkShardDashboard() {
                 disabled={!file || isBusy}
                 className="flex items-center gap-1.5 rounded-md bg-[#F5A623] px-4 py-2 text-sm font-medium text-[#0A0E14] transition disabled:cursor-not-allowed disabled:opacity-40 hover:brightness-110"
               >
-                {isBusy ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                {isBusy ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Sparkles size={14} />
+                )}
                 {isBusy ? "Routing\u2026" : "Process file"}
               </button>
               <button
@@ -455,8 +510,16 @@ export default function BulkShardDashboard() {
 
             {/* Stats */}
             <div className="mt-6 grid grid-cols-3 gap-3">
-              <StatCard label="total rows" value={stats.total} color="#E7EBF3" />
-              <StatCard label="inserted" value={stats.success} color="#2DD4BF" />
+              <StatCard
+                label="total rows"
+                value={stats.total}
+                color="#E7EBF3"
+              />
+              <StatCard
+                label="inserted"
+                value={stats.success}
+                color="#2DD4BF"
+              />
               <StatCard label="failed" value={stats.failed} color="#FB7185" />
             </div>
           </div>
@@ -465,12 +528,16 @@ export default function BulkShardDashboard() {
           <div className="rounded-xl border border-[#232C3D] bg-[#121826] p-6 lg:col-span-3">
             <div className="mb-5 flex items-center justify-between">
               <div>
-                <p className="font-mono text-xs uppercase tracking-[0.2em] text-[#8A93A6]">shard router</p>
+                <p className="font-mono text-xs uppercase tracking-[0.2em] text-[#8A93A6]">
+                  shard router
+                </p>
                 <p className="mt-1 font-mono text-[11px] text-[#8A93A6]">
                   shard = \u03a3 charcode(customer_id) mod {TOTAL_SHARDS}
                 </p>
               </div>
-              <span className="font-mono text-xs text-[#8A93A6]">{totalRouted} routed</span>
+              <span className="font-mono text-xs text-[#8A93A6]">
+                {totalRouted} routed
+              </span>
             </div>
 
             <div className="grid grid-cols-4 gap-4">
@@ -480,7 +547,10 @@ export default function BulkShardDashboard() {
                 const isActive = activeShard === idx;
                 return (
                   <div key={idx} className="flex flex-col items-center">
-                    <p className="font-mono text-lg font-medium" style={{ color: c.hex }}>
+                    <p
+                      className="font-mono text-lg font-medium"
+                      style={{ color: c.hex }}
+                    >
                       {count}
                     </p>
                     <div
@@ -489,7 +559,8 @@ export default function BulkShardDashboard() {
                         borderColor: isActive ? c.hex : "#232C3D",
                         background: "#0A0E14",
                         boxShadow: isActive ? `0 0 16px ${c.glow}` : "none",
-                        transition: "box-shadow 200ms ease, border-color 200ms ease",
+                        transition:
+                          "box-shadow 200ms ease, border-color 200ms ease",
                       }}
                     >
                       <div
@@ -500,7 +571,9 @@ export default function BulkShardDashboard() {
                         }}
                       />
                     </div>
-                    <p className="mt-2 font-mono text-[11px] text-[#8A93A6]">shard {idx}</p>
+                    <p className="mt-2 font-mono text-[11px] text-[#8A93A6]">
+                      shard {idx}
+                    </p>
                   </div>
                 );
               })}
@@ -511,7 +584,9 @@ export default function BulkShardDashboard() {
         {/* Log console */}
         <div className="mt-6 overflow-hidden rounded-xl border border-[#232C3D] bg-[#0D131F]">
           <div className="flex items-center justify-between border-b border-[#232C3D] px-4 py-2.5">
-            <p className="font-mono text-xs uppercase tracking-[0.2em] text-[#8A93A6]">activity log</p>
+            <p className="font-mono text-xs uppercase tracking-[0.2em] text-[#8A93A6]">
+              activity log
+            </p>
             {status === "done" && (
               <span className="flex items-center gap-1.5 font-mono text-xs text-[#2DD4BF]">
                 <CheckCircle2 size={13} /> complete
@@ -520,7 +595,9 @@ export default function BulkShardDashboard() {
           </div>
           <div className="h-56 overflow-y-auto px-4 py-3 font-mono text-[12px] leading-relaxed">
             {logLines.length === 0 && (
-              <p className="text-[#4B5468]">Waiting for a file to process\u2026</p>
+              <p className="text-[#4B5468]">
+                Waiting for a file to process\u2026
+              </p>
             )}
             {logLines.map((l, i) => (
               <p key={i} className="whitespace-pre-wrap break-all">
@@ -530,8 +607,8 @@ export default function BulkShardDashboard() {
                     l.level === "FAILED_RECORD"
                       ? "text-[#FB7185]"
                       : l.level === "ERROR"
-                      ? "text-[#FB7185]"
-                      : "text-[#38BDF8]"
+                        ? "text-[#FB7185]"
+                        : "text-[#38BDF8]"
                   }
                 >
                   [{l.level}]
@@ -546,7 +623,7 @@ export default function BulkShardDashboard() {
         <p className="mt-6 text-center text-xs text-[#4B5468]">
           {mode === "demo"
             ? "Running in demo mode \u2014 validation and shard routing happen locally in your browser."
-            : `Live mode \u2014 posting to ${API_BASE_URL}/upload-orders`}
+            : `Live mode \u2014 posting to ${apiBase}/upload-orders`}
         </p>
       </div>
     </div>
@@ -559,7 +636,9 @@ function StatCard({ label, value, color }) {
       <p className="font-mono text-xl font-semibold" style={{ color }}>
         {value}
       </p>
-      <p className="mt-0.5 font-mono text-[10px] uppercase tracking-wide text-[#8A93A6]">{label}</p>
+      <p className="mt-0.5 font-mono text-[10px] uppercase tracking-wide text-[#8A93A6]">
+        {label}
+      </p>
     </div>
   );
 }

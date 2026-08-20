@@ -12,8 +12,6 @@ import {
   Radio,
 } from "lucide-react";
 
-import.meta.env.VITE_apiBase;
-
 // Mirrors the backend exactly: utils/shard.util.js + validators/order.validator.js
 const TOTAL_SHARDS = 4;
 
@@ -79,7 +77,7 @@ export default function BulkShardDashboard() {
   const [mode, setMode] = useState("demo"); // "demo" | "live"
 
   const [apiBase, setApiBase] = useState(
-    import.meta.env.VITE_apiBase || "/api",
+    import.meta.env.VITE_API_BASE_URL || "/api",
   );
   const [showSettings, setShowSettings] = useState(false);
   const [health, setHealth] = useState("unknown"); // unknown | ok | down | checking
